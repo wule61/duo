@@ -6,6 +6,14 @@ import (
 	"strings"
 )
 
+type Table interface {
+	TableName() string
+}
+
+type Querier interface {
+	Query() (string, []any)
+}
+
 const (
 	MySQL    = "mysql"
 	SQLite   = "sqlite3"
@@ -197,6 +205,10 @@ func (b *Builder) AddError(err error) *Builder {
 	return b
 }
 
+type QuerierErr interface {
+	Err() error
+}
+
 func (b *Builder) Err() error {
 	if len(b.errs) == 0 {
 		return nil
@@ -238,85 +250,58 @@ func (b *Builder) mysql() bool {
 	return b.dialect == MySQL
 }
 
-type InsertBuilder struct {
-	Builder
-	table     string
-	schema    string
-	columns   []string
-	defaults  bool
-	returning []string
-	values    [][]any
+func (b *Builder) Join(qs ...Querier) *Builder {
+	return b.join(qs, "")
 }
 
-func Insert(table string) *InsertBuilder {
-	return &InsertBuilder{table: table}
+func (b *Builder) JoinComma(qs ...Querier) *Builder {
+	return b.join(qs, ", ")
 }
 
-func (i *InsertBuilder) Schema(schema string) *InsertBuilder {
-	i.schema = schema
-	return i
-}
+func (b *Builder) join(qs []Querier, spe string) *Builder {
+	for i, q := range qs {
+		if i > 0 {
+			b.WriteString(spe)
+		}
 
-func (i *InsertBuilder) Columns(columns ...string) *InsertBuilder {
-	i.columns = append(i.columns, columns...)
-	return i
-}
+		if st, ok := q.(state); ok {
+			st.SetDialect(b.dialect)
+			st.SetTotal(b.total)
+		}
 
-func (i *InsertBuilder) Values(values ...any) *InsertBuilder {
-	i.values = append(i.values, values)
-	return i
-}
+		query, args := q.Query()
+		b.WriteString(query)
+		b.args = append(b.args, args...)
+		b.total += len(args)
 
-func (i *InsertBuilder) Set(column string, v any) *InsertBuilder {
-	i.columns = append(i.columns, column)
-	if len(i.values) == 0 {
-		i.values = append(i.values, []any{v})
-	} else {
-		i.values[0] = append(i.values[0], v)
-	}
-	return i
-}
-
-func (i *InsertBuilder) Defaulte() *InsertBuilder {
-	i.defaults = true
-	return i
-}
-
-func (i *InsertBuilder) Returning(columns ...string) *InsertBuilder {
-	i.returning = append(i.returning, columns...)
-	return i
-}
-
-func (i *InsertBuilder) writeDefault() *InsertBuilder {
-	switch i.Dialect() {
-	case MySQL:
-		i.WriteString("()")
-	case Postgres, SQLite:
-		i.WriteString("DEFAULT VALUES")
-	}
-	return i
-}
-
-func (i *InsertBuilder) Query() (string, []any) {
-	i.WriteString("INSERT INTO ")
-	i.writeSchema(i.schema)
-	i.Ident(i.table).Pad()
-	if i.defaults && len(i.columns) == 0 {
-		i.writeDefault()
-	} else {
-		i.WriteByte('(').IdentComma(i.columns...).WriteByte(')')
-		i.WriteString(" VALUES ")
-		for j, v := range i.values {
-			if j > 0 {
-				i.Comma()
+		if qe, ok := q.(QuerierErr); ok {
+			if err := qe.Err(); err != nil {
+				b.AddError(err)
 			}
-			i.WriteByte('(').Args(v...).WriteByte(')')
 		}
 	}
-	if len(i.returning) > 0 && !i.mysql() {
-		i.WriteString(" RETURNING ")
-		i.IdentComma(i.returning...)
-	}
 
-	return i.String(), i.args
+	return b
+}
+
+func (b *Builder) Nested(f func(*Builder)) *Builder {
+	nb := &Builder{dialect: b.dialect, total: b.total, sb: &strings.Builder{}}
+	nb.WriteByte('(')
+	f(nb)
+	nb.WriteByte(')')
+	b.WriteString(nb.String())
+	b.args = append(b.args, nb.args...)
+	b.total = nb.total
+	return b
+}
+
+func (b *Builder) Query() (string, []any) {
+	return b.String(), b.args
+}
+
+type state interface {
+	Dialect() string
+	SetDialect(string)
+	Total() int
+	SetTotal(int)
 }
